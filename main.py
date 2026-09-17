@@ -1,5 +1,43 @@
+import os
+import re
+import urllib.parse
+from fastapi import FastAPI, HTTPException, Query
+import httpx
+
+# FastAPI instance MUST be named 'app' for uvicorn main:app
+app = FastAPI(title="Eclipse TorBox Bridge")
+
+# Environment Variables (Configured on Render or local .env)
+JACKETT_URL = os.getenv("JACKETT_URL", "http://localhost:9117")
+JACKETT_API_KEY = os.getenv("JACKETT_API_KEY", "")
+TORBOX_API_KEY = os.getenv("TORBOX_API_KEY", "")
+
+# -------------------------------------------------------------------
+# 1. Root & Manifest Endpoints
+# -------------------------------------------------------------------
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "Eclipse TorBox Bridge",
+        "manifest": "/manifest.json"
+    }
+
+@app.get("/manifest.json")
+async def manifest():
+    return {
+        "id": "com.user.torbox-debrid",
+        "name": "TorBox FLAC Bridge",
+        "version": "1.0.0",
+        "description": "Searches Jackett, checks TorBox cache, and streams 24-bit/16-bit FLACs.",
+        "resources": ["search", "stream"],
+        "types": ["track", "album"]
+    }
+
+# -------------------------------------------------------------------
+# 2. Metadata Cleaning via MusicBrainz (Spelling & Metadata)
+# -------------------------------------------------------------------
 async def correct_song_name(query: str):
-    # Check if user/app sent "Artist - Song" format
     artist_hint = ""
     title_hint = query
     if " - " in query:
@@ -7,7 +45,6 @@ async def correct_song_name(query: str):
         artist_hint = parts[0].strip()
         title_hint = parts[1].strip()
 
-    # Build Lucene query for MusicBrainz
     clean_title = re.sub(r'[^\w\s]', '', title_hint)
     mb_query = f'recording:"{clean_title}"'
     if artist_hint:
@@ -27,11 +64,9 @@ async def correct_song_name(query: str):
                     best = recordings[0]
                     title = best.get("title", title_hint)
                     
-                    # Extract artist name
                     artist_credits = best.get("artist-credit", [])
-                    artist = artist_credits[0].get("name", "Unknown Artist") if artist_credits else "Unknown Artist"
+                    artist = artist_credits[0].get("name", "Various Artists") if artist_credits else "Various Artists"
                     
-                    # Extract album release title
                     releases = best.get("releases", [])
                     album = releases[0].get("title", "") if releases else ""
                     
@@ -39,7 +74,134 @@ async def correct_song_name(query: str):
     except Exception:
         pass
 
-    # Direct fallback if MusicBrainz API returns no results
     if artist_hint:
         return f"{artist_hint} - {title_hint}", title_hint, artist_hint, ""
     return query, query.capitalize(), "Various Artists", ""
+
+# -------------------------------------------------------------------
+# 3. Search Endpoint
+# -------------------------------------------------------------------
+@app.get("/search")
+async def search(q: str = Query(...)):
+    corrected_query, title, artist, album = await correct_song_name(q)
+    
+    # Sanitize string to prevent breaking route paths
+    safe_id_string = re.sub(r'[:/?#\[\]@!$&\'()*+,;=]', '', corrected_query)
+    
+    return {
+        "results": [
+            {
+                "id": f"track_{safe_id_string}",
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "format": "flac"
+            }
+        ]
+    }
+
+# -------------------------------------------------------------------
+# 4. Stream Endpoint (Sanitized Query -> Jackett -> TorBox -> Stream)
+# -------------------------------------------------------------------
+@app.get("/stream/{track_id:path}")
+async def get_stream(track_id: str):
+    decoded_id = urllib.parse.unquote(track_id)
+    raw_query = decoded_id.replace("track_", "")
+    
+    # Strip characters that break torrent indexers
+    jackett_query = re.sub(r'[:/\\?#]', ' ', raw_query)
+    jackett_query = ' '.join(jackett_query.split())
+    
+    # A. Search Jackett API
+    jackett_endpoint = f"{JACKETT_URL.rstrip('/')}/api/v2.0/indexers/all/results"
+    params = {
+        "apikey": JACKETT_API_KEY,
+        "Query": f"{jackett_query} FLAC"
+    }
+    
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            res = await client.get(jackett_endpoint, params=params)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Failed to connect to Jackett: {str(e)}")
+
+        if res.status_code != 200:
+            raise HTTPException(status_code=502, detail="Jackett lookup failed")
+        
+        results = res.json().get("Results", [])
+        if not results:
+            raise HTTPException(status_code=404, detail=f"No FLAC torrents found for query: {jackett_query}")
+        
+        # B. Prioritize 24-bit FLAC over 16-bit FLAC
+        selected_magnet = None
+        
+        # Tier 1 Search: 24-bit / Hi-Res
+        for item in results:
+            title = item.get("Title", "").lower()
+            if any(k in title for k in ["24bit", "24-bit", "24 bit", "hires", "hi-res"]):
+                selected_magnet = item.get("MagnetUri") or item.get("Link")
+                if selected_magnet:
+                    break
+        
+        # Tier 2 Fallback: General FLAC (16-bit)
+        if not selected_magnet:
+            for item in results:
+                if "flac" in item.get("Title", "").lower():
+                    selected_magnet = item.get("MagnetUri") or item.get("Link")
+                    if selected_magnet:
+                        break
+
+        if not selected_magnet:
+            raise HTTPException(status_code=404, detail="Suitable FLAC releases not found")
+
+        # C. Send Magnet Link to TorBox
+        torbox_headers = {"Authorization": f"Bearer {TORBOX_API_KEY}"}
+        add_torrent_res = await client.post(
+            "https://api.torbox.app/v1/api/torrents/createtorrent",
+            headers=torbox_headers,
+            data={"magnet": selected_magnet, "seed": "1", "allow_zip": "false"}
+        )
+        
+        torbox_data = add_torrent_res.json()
+        if not torbox_data.get("success"):
+            raise HTTPException(status_code=500, detail=f"TorBox error: {torbox_data.get('detail', 'Unknown error')}")
+            
+        torrent_id = torbox_data["data"]["torrent_id"]
+
+        # D. Fetch Direct Download / Stream Link from TorBox
+        info_res = await client.get(
+            f"https://api.torbox.app/v1/api/torrents/mylist?id={torrent_id}",
+            headers=torbox_headers
+        )
+        info_data = info_res.json().get("data", {})
+        
+        if isinstance(info_data, list) and len(info_data) > 0:
+            info_data = info_data[0]
+            
+        files = info_data.get("files", [])
+        
+        # Find the primary FLAC audio file inside the torrent
+        audio_file_id = None
+        for f in files:
+            if f.get("name", "").lower().endswith(".flac"):
+                audio_file_id = f.get("id")
+                break
+                
+        if audio_file_id is None and files:
+            audio_file_id = files[0].get("id")
+
+        # E. Generate streamable link
+        link_res = await client.get(
+            f"https://api.torbox.app/v1/api/torrents/requestdl?token={TORBOX_API_KEY}&torrent_id={torrent_id}&file_id={audio_file_id}&zip=false"
+        )
+        
+        stream_url = link_res.json().get("data")
+        if not stream_url:
+            raise HTTPException(status_code=500, detail="Could not retrieve stream URL from TorBox")
+
+        # F. Return playable HTTP URL to Eclipse
+        return {
+            "url": stream_url,
+            "format": "flac",
+            "container": "flac"
+        }
