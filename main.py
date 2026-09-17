@@ -7,10 +7,15 @@ import httpx
 # FastAPI instance MUST be named 'app' for uvicorn main:app
 app = FastAPI(title="Eclipse TorBox Bridge")
 
-# Environment Variables (Configured on Render or local .env)
-JACKETT_URL = os.getenv("JACKETT_URL", "http://localhost:9117")
-JACKETT_API_KEY = os.getenv("JACKETT_API_KEY", "")
-TORBOX_API_KEY = os.getenv("TORBOX_API_KEY", "")
+# Environment Variables (Configured on Render)
+raw_jackett_url = os.getenv("JACKETT_URL", "http://localhost:9117").strip()
+if raw_jackett_url and not raw_jackett_url.startswith(("http://", "https://")):
+    JACKETT_URL = f"https://{raw_jackett_url}"
+else:
+    JACKETT_URL = raw_jackett_url
+
+JACKETT_API_KEY = os.getenv("JACKETT_API_KEY", "").strip()
+TORBOX_API_KEY = os.getenv("TORBOX_API_KEY", "").strip()
 
 # -------------------------------------------------------------------
 # 1. Root & Manifest Endpoints
@@ -123,7 +128,7 @@ async def get_stream(track_id: str):
         try:
             res = await client.get(jackett_endpoint, params=params)
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Failed to connect to Jackett: {str(e)}")
+            raise HTTPException(status_code=502, detail=f"Failed to connect to Jackett at {JACKETT_URL}: {str(e)}")
 
         if res.status_code != 200:
             raise HTTPException(status_code=502, detail="Jackett lookup failed")
