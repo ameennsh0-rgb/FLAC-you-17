@@ -159,19 +159,36 @@ async def get_stream(track_id: str):
         if not selected_magnet:
             raise HTTPException(status_code=404, detail="Suitable FLAC releases not found")
 
-        # C. Send Magnet Link to TorBox
+       # C. Send Link to TorBox (Handles both raw Magnet URIs and HTTP .torrent URLs)
         torbox_headers = {"Authorization": f"Bearer {TORBOX_API_KEY}"}
-        add_torrent_res = await client.post(
-            "https://api.torbox.app/v1/api/torrents/createtorrent",
-            headers=torbox_headers,
-            data={"magnet": selected_magnet, "seed": "1", "allow_zip": "false"}
-        )
+        
+        if selected_magnet.startswith("magnet:?"):
+            # Direct Magnet URI
+            payload = {"magnet": selected_magnet, "seed": "1", "allow_zip": "false"}
+            add_torrent_res = await client.post(
+                "https://api.torbox.app/v1/api/torrents/createtorrent",
+                headers=torbox_headers,
+                data=payload
+            )
+        else:
+            # HTTP .torrent file URL: Download .torrent bytes and upload as file
+            torrent_file_res = await client.get(selected_magnet, follow_redirects=True)
+            if torrent_file_res.status_code != 200:
+                raise HTTPException(status_code=502, detail="Failed to fetch .torrent file from indexer")
+            
+            files = {
+                "file": ("download.torrent", torrent_file_res.content, "application/x-bittorrent")
+            }
+            add_torrent_res = await client.post(
+                "https://api.torbox.app/v1/api/torrents/createtorrent",
+                headers=torbox_headers,
+                files=files,
+                data={"seed": "1", "allow_zip": "false"}
+            )
         
         torbox_data = add_torrent_res.json()
         if not torbox_data.get("success"):
             raise HTTPException(status_code=500, detail=f"TorBox error: {torbox_data.get('detail', 'Unknown error')}")
-            
-        torrent_id = torbox_data["data"]["torrent_id"]
 
         # D. Fetch Direct Download / Stream Link from TorBox
         info_res = await client.get(
