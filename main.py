@@ -4,10 +4,9 @@ import urllib.parse
 from fastapi import FastAPI, HTTPException, Query
 import httpx
 
-# FastAPI instance MUST be named 'app' for uvicorn main:app
 app = FastAPI(title="Eclipse TorBox Bridge")
 
-# Environment Variables (Configured on Render)
+# Environment Variables Configured on Render
 raw_jackett_url = os.getenv("JACKETT_URL", "http://localhost:9117").strip()
 if raw_jackett_url and not raw_jackett_url.startswith(("http://", "https://")):
     JACKETT_URL = f"https://{raw_jackett_url}"
@@ -40,7 +39,7 @@ async def manifest():
     }
 
 # -------------------------------------------------------------------
-# 2. Metadata Cleaning via MusicBrainz (Spelling & Metadata)
+# 2. Metadata Cleaning via MusicBrainz
 # -------------------------------------------------------------------
 async def correct_song_name(query: str):
     artist_hint = ""
@@ -106,7 +105,7 @@ async def search(q: str = Query(...)):
     }
 
 # -------------------------------------------------------------------
-# 4. Stream Endpoint (Sanitized Query -> Jackett -> TorBox -> Stream)
+# 4. Stream Endpoint (Handles Magnets & .torrent Files)
 # -------------------------------------------------------------------
 @app.get("/stream/{track_id:path}")
 async def get_stream(track_id: str):
@@ -124,7 +123,7 @@ async def get_stream(track_id: str):
         "Query": f"{jackett_query} FLAC"
     }
     
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=20.0) as client:
         try:
             res = await client.get(jackett_endpoint, params=params)
         except Exception as e:
@@ -138,41 +137,40 @@ async def get_stream(track_id: str):
             raise HTTPException(status_code=404, detail=f"No FLAC torrents found for query: {jackett_query}")
         
         # B. Prioritize 24-bit FLAC over 16-bit FLAC
-        selected_magnet = None
+        selected_link = None
         
         # Tier 1 Search: 24-bit / Hi-Res
         for item in results:
             title = item.get("Title", "").lower()
             if any(k in title for k in ["24bit", "24-bit", "24 bit", "hires", "hi-res"]):
-                selected_magnet = item.get("MagnetUri") or item.get("Link")
-                if selected_magnet:
+                selected_link = item.get("MagnetUri") or item.get("Link")
+                if selected_link:
                     break
         
         # Tier 2 Fallback: General FLAC (16-bit)
-        if not selected_magnet:
+        if not selected_link:
             for item in results:
                 if "flac" in item.get("Title", "").lower():
-                    selected_magnet = item.get("MagnetUri") or item.get("Link")
-                    if selected_magnet:
+                    selected_link = item.get("MagnetUri") or item.get("Link")
+                    if selected_link:
                         break
 
-        if not selected_magnet:
+        if not selected_link:
             raise HTTPException(status_code=404, detail="Suitable FLAC releases not found")
 
-       # C. Send Link to TorBox (Handles both raw Magnet URIs and HTTP .torrent URLs)
+        # C. Send Link to TorBox (Handles both raw Magnet URIs and HTTP .torrent URLs)
         torbox_headers = {"Authorization": f"Bearer {TORBOX_API_KEY}"}
         
-        if selected_magnet.startswith("magnet:?"):
-            # Direct Magnet URI
-            payload = {"magnet": selected_magnet, "seed": "1", "allow_zip": "false"}
+        if selected_link.startswith("magnet:?"):
+            payload = {"magnet": selected_link, "seed": "1", "allow_zip": "false"}
             add_torrent_res = await client.post(
                 "https://api.torbox.app/v1/api/torrents/createtorrent",
                 headers=torbox_headers,
                 data=payload
             )
         else:
-            # HTTP .torrent file URL: Download .torrent bytes and upload as file
-            torrent_file_res = await client.get(selected_magnet, follow_redirects=True)
+            # HTTP .torrent download link
+            torrent_file_res = await client.get(selected_link, follow_redirects=True)
             if torrent_file_res.status_code != 200:
                 raise HTTPException(status_code=502, detail="Failed to fetch .torrent file from indexer")
             
@@ -189,6 +187,8 @@ async def get_stream(track_id: str):
         torbox_data = add_torrent_res.json()
         if not torbox_data.get("success"):
             raise HTTPException(status_code=500, detail=f"TorBox error: {torbox_data.get('detail', 'Unknown error')}")
+            
+        torrent_id = torbox_data["data"]["torrent_id"]
 
         # D. Fetch Direct Download / Stream Link from TorBox
         info_res = await client.get(
